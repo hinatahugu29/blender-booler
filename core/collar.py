@@ -42,6 +42,7 @@ class CollarResult:
     cap_loops: list[CapLoop] = field(default_factory=list)
     collar_face_count: int = 0
     cutout_face_count: int = 0
+    parity_splits: int = 0
 
 
 def _detect_corners(coords: list[Vector], is_closed: bool, angle_deg: float = 30.0) -> list[int]:
@@ -502,6 +503,123 @@ def _expand_and_clean_cutout(
     return to_remove
 
 
+def _loop_cutout_components(
+    inter_loops: list[IntersectionLoop],
+    to_remove: set[bmesh.types.BMFace],
+    layer_obj,
+) -> dict[tuple[int, int], int]:
+    """Map (side_id, loop index) -> id of the edge-connected cutout region its cut faces lie in."""
+    comp: dict[bmesh.types.BMFace, int] = {}
+    next_id = 0
+    for seed in to_remove:
+        if seed in comp:
+            continue
+        sid = seed[layer_obj] if layer_obj is not None else None
+        comp[seed] = next_id
+        stack = [seed]
+        while stack:
+            f = stack.pop()
+            for e in f.edges:
+                for nf in e.link_faces:
+                    if nf in comp or nf not in to_remove:
+                        continue
+                    if layer_obj is not None and nf[layer_obj] != sid:
+                        continue
+                    comp[nf] = next_id
+                    stack.append(nf)
+        next_id += 1
+
+    result: dict[tuple[int, int], int] = {}
+    for li, loop in enumerate(inter_loops):
+        for v in loop.verts:
+            for f in v.link_faces:
+                c = comp.get(f)
+                if c is None:
+                    continue
+                sid = f[layer_obj] if layer_obj is not None else 1
+                result.setdefault((sid, li), c)
+    return result
+
+
+def _walk_quad_column(
+    start: bmesh.types.BMEdge,
+    boundary: set[bmesh.types.BMEdge],
+) -> list[bmesh.types.BMEdge] | None:
+    """Walk an edge ring (opposite edges of successive quads) from boundary edge `start`.
+
+    Returns the ring edges from `start` to the next boundary edge, or None if the walk hits a
+    non-quad, loops back on itself, or runs off the mesh.
+    """
+    if len(start.link_faces) != 1:
+        return None
+    ring = [start]
+    e = start
+    f = start.link_faces[0]
+    seen: set[bmesh.types.BMFace] = set()
+    while True:
+        if len(f.verts) != 4 or f in seen:
+            return None
+        seen.add(f)
+        opp = next((fe for fe in f.edges if not (set(fe.verts) & set(e.verts))), None)
+        if opp is None:
+            return None
+        ring.append(opp)
+        if opp in boundary:
+            return ring
+        nxt = [nf for nf in opp.link_faces if nf != f]
+        if not nxt:
+            return None
+        e, f = opp, nxt[0]
+
+
+def _fix_outer_loop_parity(bm: bmesh.types.BMesh, max_splits: int = 16) -> int:
+    """Make every boundary loop even by splitting quad columns that connect pairs of odd loops.
+
+    Splitting a column of quads lengthwise adds one vertex to the boundary loop at each end, so
+    two odd loops become even while the surface stays all-quad and geometrically unchanged.
+    Returns the number of columns split. Odd loops with no reachable odd partner are left as is.
+    """
+    layer_obj = bm.faces.layers.int.get(ATTR_ORIG_OBJ)
+    splits = 0
+    for _ in range(max_splits):
+        boundary = [e for e in bm.edges if e.is_boundary and len(e.link_faces) == 1]
+        loops = _extract_ordered_boundary_loops(boundary)
+        loop_of_edge: dict[bmesh.types.BMEdge, int] = {}
+        odd: set[int] = set()
+        for li, verts in enumerate(loops):
+            n = len(verts)
+            if n % 2:
+                odd.add(li)
+            for k in range(n):
+                e = bm.edges.get((verts[k], verts[(k + 1) % n]))
+                if e is not None:
+                    loop_of_edge[e] = li
+        if len(odd) < 2:
+            break
+
+        boundary_set = set(boundary)
+        best: list[bmesh.types.BMEdge] | None = None
+        for e, li in loop_of_edge.items():
+            if li not in odd:
+                continue
+            ring = _walk_quad_column(e, boundary_set)
+            if ring is None:
+                continue
+            end_li = loop_of_edge.get(ring[-1])
+            if end_li is None or end_li == li or end_li not in odd:
+                continue
+            if layer_obj is not None and e.link_faces[0][layer_obj] != ring[-1].link_faces[0][layer_obj]:
+                continue
+            if best is None or len(ring) < len(best):
+                best = ring  # shortest column touches the fewest preserved faces
+        if best is None:
+            break
+
+        bmesh.ops.subdivide_edges(bm, edges=best, cuts=1, use_grid_fill=False)
+        splits += 1
+    return splits
+
+
 def build_collar_and_cutout(
     cut_res: BooleanCutResult,
     bvh_a: BVHTree,
@@ -613,6 +731,10 @@ def build_collar_and_cutout(
         )
         loop_data.append((is_closed, resampled, rings_a, rings_b))
 
+    # Record which connected cutout region each intersection loop's cut faces belong to, per side
+    # (before deletion), so rims left without an outer boundary can be paired correctly later.
+    loop_cutout_comp = _loop_cutout_components(cut_res.inter_loops, to_remove, layer_obj)
+
     # Delete cutout faces now
     cutout_count = len(to_remove)
     if to_remove:
@@ -625,6 +747,11 @@ def build_collar_and_cutout(
     loose_verts = [v for v in bm.verts if not v.link_edges]
     if loose_verts:
         bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+
+    # 2b. An all-quad annulus needs an even total edge count, but a preserved region with several
+    #     boundary loops only guarantees an even *sum*: single loops can be odd (e.g. both rims of
+    #     an odd-segment cylinder wall). Pair odd loops by splitting one quad column between them.
+    parity_splits = _fix_outer_loop_parity(bm)
 
     # 3. Extract outer boundary loops per side (from the untouched original mesh)
     outer_edges_by_side: dict[int, list[bmesh.types.BMEdge]] = {1: [], 2: []}
@@ -716,10 +843,25 @@ def build_collar_and_cutout(
                 )
             )
 
-        # Any remaining closed inner rim has no remaining outer mesh on that side -> cap with all-quads
-        for ii, (iring, is_closed) in enumerate(inners):
-            if ii not in matched_in and is_closed:
-                cap_loops.append(CapLoop(side_id=side_id, verts=iring))
+        # Remaining closed inner rims have no outer mesh left on that side. Rims whose cutout
+        # regions are connected bound the same removed band (e.g. a short cylinder wall cut out
+        # entirely between two intersection loops) -> bridge rim to rim. Isolated rims -> cap.
+        leftovers = [ii for ii, (_, closed) in enumerate(inners) if ii not in matched_in and closed]
+        by_comp: dict[object, list[int]] = {}
+        for ii in leftovers:
+            comp = loop_cutout_comp.get((side_id, ii))
+            by_comp.setdefault(comp if comp is not None else ("solo", ii), []).append(ii)
+        for members in by_comp.values():
+            pending = list(members)
+            while len(pending) >= 2:
+                ia = pending.pop(0)
+                ib = min(pending, key=lambda k: _loop_pair_distance(inners[ia][0], inners[k][0]))
+                pending.remove(ib)
+                gap_pairs.append(
+                    GapPair(side_id=side_id, inner_verts=inners[ia][0], outer_verts=inners[ib][0])
+                )
+            for ii in pending:
+                cap_loops.append(CapLoop(side_id=side_id, verts=inners[ii][0]))
 
     bm.normal_update()
     return CollarResult(
@@ -728,4 +870,5 @@ def build_collar_and_cutout(
         cap_loops=cap_loops,
         collar_face_count=collar_faces_created,
         cutout_face_count=cutout_count,
+        parity_splits=parity_splits,
     )

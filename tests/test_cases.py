@@ -210,6 +210,30 @@ def case_8_chained_boolean() -> tuple[bpy.types.Object, bpy.types.Object, str]:
     return step1, hole, "DIFFERENCE"
 
 
+def case_9_odd_segment_through_hole() -> tuple[bpy.types.Object, bpy.types.Object, str]:
+    """Through-hole with an odd-segment cylinder: each kept wall rim loop has an odd edge count."""
+    _clear_scene()
+    a = _create_quad_cube("OddBase", size=2.0, cuts=4, location=(0, 0, 0))
+    b = _create_quad_cylinder("OddCyl", radius=0.45, depth=3.0, segments=15, rings=6, location=(0.15, 0.1, 0))
+    return a, b, "DIFFERENCE"
+
+
+def case_10_cross_hole_rim_to_rim() -> tuple[bpy.types.Object, bpy.types.Object, str]:
+    """Cross hole through a pipe: the short cutter wall inside is cut out entirely (rim-to-rim fill)."""
+    _clear_scene()
+    a = _create_quad_cylinder("CrossPipe", radius=0.6, depth=2.6, segments=16, rings=8, location=(0, 0, 0))
+    b = _create_quad_cylinder(
+        "CrossHole",
+        radius=0.3,
+        depth=3.0,
+        segments=16,
+        rings=6,
+        location=(0.0, 0.0, 0.2),
+        rotation=(0, math.radians(90), 0),
+    )
+    return a, b, "DIFFERENCE"
+
+
 ALL_CASES: list[tuple[str, Callable[[], tuple[bpy.types.Object, bpy.types.Object, str]]]] = [
     ("Case1_BoxBox_Union", case_1_box_box_union),
     ("Case2_CubeCyl_Diff", case_2_cube_cyl_diff),
@@ -219,4 +243,6 @@ ALL_CASES: list[tuple[str, Callable[[], tuple[bpy.types.Object, bpy.types.Object
     ("Case6_DensityMismatch_Diff", case_6_density_mismatch),
     ("Case7_NonUniformScale_Union", case_7_non_uniform_scale),
     ("Case8_ChainedBooler_Diff", case_8_chained_boolean),
+    ("Case9_OddSegmentHole_Diff", case_9_odd_segment_through_hole),
+    ("Case10_CrossHoleRimToRim_Diff", case_10_cross_hole_rim_to_rim),
 ]
