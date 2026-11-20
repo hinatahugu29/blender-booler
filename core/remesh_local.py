@@ -12,6 +12,7 @@ from mathutils.bvhtree import BVHTree
 
 from .boolean_cut import ATTR_ORIG_OBJ, ATTR_PRESERVED
 from .collar import CapLoop, GapPair
+from .topology_opt import accept_quality_move
 
 
 @dataclass
@@ -243,11 +244,13 @@ def _project_and_relax_verts(
     bvh: BVHTree,
     iterations: int = 8,
 ) -> None:
-    """Relax internal vertices via Laplacian smoothing with surface projection onto `bvh`."""
+    """Relax internal vertices via Laplacian smoothing with surface projection onto `bvh`.
+
+    Gauss-Seidel sweeps; a move is applied only if it does not degrade the vertex's faces.
+    """
     if not internal_verts:
         return
     for _ in range(iterations):
-        new_pos: dict[bmesh.types.BMVert, Vector] = {}
         for v in internal_verts:
             nbrs = [e.other_vert(v).co for e in v.link_edges]
             if not nbrs:
@@ -255,9 +258,9 @@ def _project_and_relax_verts(
             avg = sum(nbrs, Vector()) / len(nbrs)
             blended = v.co.lerp(avg, 0.6)
             loc, _, _, _ = bvh.find_nearest(blended)
-            new_pos[v] = loc.copy() if loc is not None else blended
-        for v, pos in new_pos.items():
-            v.co = pos
+            cand = loc.copy() if loc is not None else blended
+            if accept_quality_move(v, cand):
+                v.co = cand
 
 
 def _bridge_single_layer_3to1(
@@ -533,6 +536,60 @@ def fill_gap_pair(
     return total_faces, len(all_internal)
 
 
+def _perimeter_to_grid(perim: list, a: int, b: int) -> list[list]:
+    """Map a closed perimeter of 2*(a+b) items onto the boundary of an (a+1) x (b+1) grid."""
+    grid: list[list] = [[None] * (b + 1) for _ in range(a + 1)]
+    idx = 0
+    for j in range(b):
+        grid[0][j] = perim[idx]; idx += 1
+    for i in range(a):
+        grid[i][b] = perim[idx]; idx += 1
+    for j in range(b, 0, -1):
+        grid[a][j] = perim[idx]; idx += 1
+    for i in range(a, 0, -1):
+        grid[i][0] = perim[idx]; idx += 1
+    return grid
+
+
+def _coons_grid_points(grid: list[list[Vector | None]], a: int, b: int) -> list[list[Vector]]:
+    """Fill interior points of a boundary-only coordinate grid by bilinear Coons interpolation."""
+    pts = [list(row) for row in grid]
+    c00, c0b, ca0, cab = grid[0][0], grid[0][b], grid[a][0], grid[a][b]
+    for i in range(1, a):
+        u = i / a
+        for j in range(1, b):
+            v = j / b
+            p_u = grid[0][j].lerp(grid[a][j], u)
+            p_v = grid[i][0].lerp(grid[i][b], v)
+            p_bilin = (
+                (1 - u) * (1 - v) * c00
+                + (1 - u) * v * c0b
+                + u * (1 - v) * ca0
+                + u * v * cab
+            )
+            pts[i][j] = p_u + p_v - p_bilin
+    return pts
+
+
+def _grid_quality(pts: list[list[Vector]], a: int, b: int) -> tuple[float, float]:
+    """Return (min interior angle in degrees, -max aspect ratio) over all grid quads."""
+    min_ang = 180.0
+    max_ar = 1.0
+    for i in range(a):
+        for j in range(b):
+            quad = (pts[i][j], pts[i][j + 1], pts[i + 1][j + 1], pts[i + 1][j])
+            lens = []
+            for k in range(4):
+                va = quad[k - 1] - quad[k]
+                vb = quad[(k + 1) % 4] - quad[k]
+                lens.append(vb.length)
+                if va.length < 1e-9 or vb.length < 1e-9:
+                    return 0.0, -float("inf")
+                min_ang = min(min_ang, math.degrees(va.angle(vb)))
+            max_ar = max(max_ar, max(lens) / max(min(lens), 1e-9))
+    return min_ang, -max_ar
+
+
 def fill_cap_loop(
     bm: bmesh.types.BMesh,
     cap: CapLoop,
@@ -558,42 +615,32 @@ def fill_cap_loop(
         except ValueError:
             return 0, 0
 
-    # Decompose m = 2*(a + b) with a <= b, a >= 1, b >= 2
+    # Decompose m = 2*(a + b) and pick the side split + perimeter start that gives the best
+    # Coons grid (largest minimum quad angle) instead of a fixed square split from index 0.
     half = m // 2
-    a = max(1, half // 2)
+    perim = [v.co for v in verts]
+    best: tuple[float, float, int, int] | None = None  # (min_angle, -max_aspect, a, start)
+    for a_try in range(1, half):
+        b_try = half - a_try
+        if a_try > b_try:
+            break  # (a, b) and (b, a) are the same grid rotated
+        for start in range(m):
+            ordered = perim[start:] + perim[:start]
+            pts = _coons_grid_points(_perimeter_to_grid(ordered, a_try, b_try), a_try, b_try)
+            score = _grid_quality(pts, a_try, b_try)
+            if best is None or score > (best[0], best[1]):
+                best = (score[0], score[1], a_try, start)
+
+    _, _, a, start = best
     b = half - a
+    verts = verts[start:] + verts[:start]
+    grid = _perimeter_to_grid(verts, a, b)
+    pts = _coons_grid_points([[v.co if v is not None else None for v in row] for row in grid], a, b)
 
-    # Map perimeter vertices to (a+1) x (b+1) grid boundary in counter-clockwise order
-    grid: list[list[bmesh.types.BMVert | None]] = [[None] * (b + 1) for _ in range(a + 1)]
-    idx = 0
-    for j in range(b):
-        grid[0][j] = verts[idx]; idx += 1
-    for i in range(a):
-        grid[i][b] = verts[idx]; idx += 1
-    for j in range(b, 0, -1):
-        grid[a][j] = verts[idx]; idx += 1
-    for i in range(a, 0, -1):
-        grid[i][0] = verts[idx]; idx += 1
-
-    # Coons patch bilinear interpolation for interior grid vertices + surface projection
     internal: list[bmesh.types.BMVert] = []
-    c00 = grid[0][0].co
-    c0b = grid[0][b].co
-    ca0 = grid[a][0].co
-    cab = grid[a][b].co
     for i in range(1, a):
-        u = i / a
         for j in range(1, b):
-            v = j / b
-            p_u = grid[0][j].co.lerp(grid[a][j].co, u)
-            p_v = grid[i][0].co.lerp(grid[i][b].co, v)
-            p_bilin = (
-                (1 - u) * (1 - v) * c00
-                + (1 - u) * v * c0b
-                + u * (1 - v) * ca0
-                + u * v * cab
-            )
-            pt = p_u + p_v - p_bilin
+            pt = pts[i][j]
             loc, _, _, _ = bvh.find_nearest(pt)
             nv = bm.verts.new(loc.copy() if loc is not None else pt)
             grid[i][j] = nv

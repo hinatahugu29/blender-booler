@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import bmesh
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
@@ -37,6 +39,64 @@ def _classify_local_verts(
             vert_side[v] = next(iter(sides))
 
     return fixed_orig, inter_verts, vert_side
+
+
+# Moves that keep every incident face at or above this minimum angle are always accepted.
+GOOD_ANGLE_DEG = 35.0
+# A move may not push any incident face beyond this edge-length aspect ratio unless that face
+# was already worse (thin support-loop strips legitimately sit around 5-15).
+MAX_ASPECT = 10.0
+
+
+def _face_quality(
+    face: bmesh.types.BMFace, moved: bmesh.types.BMVert, moved_co: Vector
+) -> tuple[float, float]:
+    """(min corner angle in degrees, edge aspect ratio) of `face` with `moved` at `moved_co`."""
+    cos = [moved_co if fv == moved else fv.co for fv in face.verts]
+    n = len(cos)
+    min_ang = 180.0
+    lens = []
+    for k in range(n):
+        va = cos[k - 1] - cos[k]
+        vb = cos[(k + 1) % n] - cos[k]
+        if va.length < 1e-9 or vb.length < 1e-9:
+            return 0.0, float("inf")
+        lens.append(vb.length)
+        min_ang = min(min_ang, math.degrees(va.angle(vb)))
+    return min_ang, max(lens) / min(lens)
+
+
+def vertex_star_quality(v: bmesh.types.BMVert, co: Vector | None = None) -> tuple[float, float]:
+    """(min angle, max aspect) over all faces around `v`, optionally with `v` placed at `co`."""
+    pos = v.co if co is None else co
+    min_ang = 180.0
+    max_ar = 1.0
+    for f in v.link_faces:
+        ang, ar = _face_quality(f, v, pos)
+        min_ang = min(min_ang, ang)
+        max_ar = max(max_ar, ar)
+    return min_ang, max_ar
+
+
+def accept_quality_move(
+    v: bmesh.types.BMVert,
+    new_co: Vector,
+    good_angle: float = GOOD_ANGLE_DEG,
+    max_aspect: float = MAX_ASPECT,
+) -> bool:
+    """Return True if moving `v` to `new_co` does not degrade its surrounding faces.
+
+    The minimum angle must stay healthy (>= good_angle) or not get worse, and the maximum
+    aspect ratio must stay within max_aspect or not get worse, so relaxation and fitting passes
+    can never fold, crush or thin out quads. Looser thresholds only block severe degradation.
+    """
+    new_ang, new_ar = vertex_star_quality(v, new_co)
+    if new_ang >= good_angle and new_ar <= max_aspect:
+        return True
+    old_ang, old_ar = vertex_star_quality(v)
+    angle_ok = new_ang >= good_angle or new_ang >= old_ang
+    aspect_ok = new_ar <= max_aspect or new_ar <= old_ar
+    return angle_ok and aspect_ok
 
 
 def _cleanup_valence2_verts(bm: bmesh.types.BMesh, fixed_verts: set[bmesh.types.BMVert]) -> int:
@@ -88,8 +148,9 @@ def optimize_local_region(
         if adj_inter:
             collar_rim[v] = adj_inter
 
+    # Gauss-Seidel sweeps: each vertex is moved in place only if the quality guard accepts it,
+    # so every accepted move is checked against its neighbors' current positions.
     for _ in range(iterations):
-        updates: dict[bmesh.types.BMVert, Vector] = {}
         for v in movable:
             bvh = bvh_a if vert_side[v] == 1 else bvh_b
             nbrs = [e.other_vert(v) for e in v.link_edges]
@@ -123,10 +184,8 @@ def optimize_local_region(
                     else:
                         cand = v.co
 
-            updates[v] = cand
-
-        for v, pos in updates.items():
-            v.co = pos
+            if accept_quality_move(v, cand):
+                v.co = cand
 
     bm.normal_update()
     return len(movable)

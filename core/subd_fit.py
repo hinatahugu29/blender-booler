@@ -7,6 +7,7 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 from .boolean_cut import ATTR_ORIG_OBJ, ATTR_PRESERVED
+from .topology_opt import accept_quality_move
 
 
 def _eval_quadratic_bezier(p0: Vector, p1: Vector, p2: Vector, t: float) -> Vector:
@@ -181,8 +182,10 @@ def apply_catmull_clark_limit_fit(
                 delta = delta.normalized() * max_step
             updates.append((v, v.co + delta))
 
+        # Shape accuracy is this stage's purpose, so only block moves that would crush a quad.
         for v, new_co in updates:
-            v.co = new_co
+            if accept_quality_move(v, new_co, good_angle=10.0, max_aspect=20.0):
+                v.co = new_co
 
     bm.normal_update()
     return len(movable)

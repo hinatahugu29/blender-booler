@@ -8,8 +8,14 @@ from dataclasses import dataclass, field
 import bmesh
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
+from mathutils.kdtree import KDTree
 
 from .boolean_cut import ATTR_ORIG_OBJ, ATTR_PRESERVED, BooleanCutResult, IntersectionLoop
+
+# Max stretch factor applied to collar offset directions at sharp corners.
+_CORNER_OFFSET_MAX = 1.35
+# Minimum bridge gap between the collar rim and the preserved boundary, in local edge lengths.
+CUTOUT_GAP_RATIO = 0.5
 
 
 @dataclass
@@ -177,14 +183,24 @@ def resample_intersection_loop(
     return resampled, new_corners
 
 
-def _estimate_local_edge_length(bm: bmesh.types.BMesh, inter_verts: set[bmesh.types.BMVert]) -> float:
-    """Estimate average edge length of untouched original faces adjacent to the intersection."""
+def _estimate_local_edge_length(
+    bm: bmesh.types.BMesh,
+    inter_verts: set[bmesh.types.BMVert],
+    side_id: int | None = None,
+) -> float:
+    """Estimate median edge length of original faces adjacent to the intersection.
+
+    With `side_id`, only faces belonging to that source object are sampled.
+    """
+    layer_obj = bm.faces.layers.int.get(ATTR_ORIG_OBJ) if side_id is not None else None
     lens = []
     seen_faces = set()
     for v in inter_verts:
         for f in v.link_faces:
             for e in f.edges:
                 for nf in e.link_faces:
+                    if layer_obj is not None and nf[layer_obj] != side_id:
+                        continue
                     if nf not in seen_faces:
                         seen_faces.add(nf)
                         for ne in nf.edges:
@@ -298,7 +314,7 @@ def _compute_side_offset_points(
                 if avg_c.length > 1e-6:
                     avg_c.normalize()
                     cos_half = max(0.65, c_list[0].dot(avg_c))
-                    cand = avg_c * min(1.35, 1.0 / cos_half)
+                    cand = avg_c * min(_CORNER_OFFSET_MAX, 1.0 / cos_half)
 
         dirs.append(cand)
 
@@ -379,14 +395,50 @@ def _extract_ordered_boundary_loops(
     return loops
 
 
+def _build_curve_kdtree(
+    loops: list[tuple[bool, list[Vector]]],
+    spacing: float,
+) -> KDTree | None:
+    """Densely sample intersection polylines into a KDTree for point-to-curve distance queries.
+
+    Nearest-sample distance over-estimates the true point-to-polyline distance by at most
+    `spacing / 2`.
+    """
+    spacing = max(spacing, 1e-6)
+    pts: list[Vector] = []
+    for is_closed, coords in loops:
+        if not coords:
+            continue
+        nxt = coords[1:] + ([coords[0]] if is_closed else [])
+        for a, b in zip(coords, nxt):
+            k = max(1, int(math.ceil((b - a).length / spacing)))
+            for t in range(k):
+                pts.append(a.lerp(b, t / k))
+        if not is_closed:
+            pts.append(coords[-1].copy())
+    if not pts:
+        return None
+    kd = KDTree(len(pts))
+    for i, p in enumerate(pts):
+        kd.insert(p, i)
+    kd.balance()
+    return kd
+
+
 def _expand_and_clean_cutout(
     bm: bmesh.types.BMesh,
     inter_verts: set[bmesh.types.BMVert],
-    offset_pts_by_side: dict[int, list[Vector]],
-    margin: float,
+    curve_kd: KDTree | None,
+    clearance_by_side: dict[int, float],
 ) -> set[bmesh.types.BMFace]:
-    """Select faces to remove around the intersection so the remaining boundary has clean clearance."""
+    """Select faces to remove around the intersection so the remaining boundary has clean clearance.
+
+    Every vertex of a kept face ends up at least its side's clearance away from the intersection
+    curve, which guarantees the gap between the collar rim and the preserved boundary has real
+    width (otherwise the bridge quads degenerate into slivers or bowties).
+    """
     layer_obj = bm.faces.layers.int.get(ATTR_ORIG_OBJ)
+    default_clearance = min(clearance_by_side.values()) if clearance_by_side else 0.0
     to_remove: set[bmesh.types.BMFace] = set()
 
     # 1. Always remove faces touching intersection vertices (they are cut/N-gon/tri faces)
@@ -394,20 +446,20 @@ def _expand_and_clean_cutout(
         for f in v.link_faces:
             to_remove.add(f)
 
-    # 2. Expand to any face having a vertex too close to the collar outer rim on the same side
-    margin_sq = margin * margin
-    for side_id, pts in offset_pts_by_side.items():
-        if not pts:
-            continue
+    # 2. Expand to any face having a vertex closer than `clearance` to the intersection curve
+    if curve_kd is not None:
+        curve_dist: dict[bmesh.types.BMVert, float] = {}
         for f in bm.faces:
             if f in to_remove:
                 continue
-            if layer_obj is not None and f[layer_obj] != side_id:
-                continue
-            # Check if any vertex of f is within `margin` of any collar rim point
+            sid = f[layer_obj] if layer_obj is not None else None
+            clearance = clearance_by_side.get(sid, default_clearance)
             for v in f.verts:
-                vco = v.co
-                if any((vco - p).length_squared < margin_sq for p in pts):
+                d = curve_dist.get(v)
+                if d is None:
+                    d = curve_kd.find(v.co)[2]
+                    curve_dist[v] = d
+                if d < clearance:
                     to_remove.add(f)
                     break
 
@@ -474,29 +526,25 @@ def build_collar_and_cutout(
     # Clamp collar width relative to local edge length so it doesn't swallow the whole mesh
     eff_width = min(collar_width, target_edge_len * 0.45)
 
-    # Pass 1: Initial coarse resample & offset to determine cutout region and outer boundary loop sizes
     raw_loop_coords = [(loop.is_closed, [v.co.copy() for v in loop.verts]) for loop in cut_res.inter_loops]
-    all_offset_pts_by_side: dict[int, list[Vector]] = {1: [], 2: []}
 
-    for is_closed, coords in raw_loop_coords:
-        resampled0, corners0 = resample_intersection_loop(
-            coords=coords,
-            is_closed=is_closed,
-            target_edge_len=target_edge_len,
-            force_even_count=True,
-        )
-        r_a0 = _compute_side_offset_points(resampled0, is_closed, corners0, 1, bm, bvh_a, eff_width, rings=1)
-        r_b0 = _compute_side_offset_points(resampled0, is_closed, corners0, 2, bm, bvh_b, eff_width, rings=1)
-        all_offset_pts_by_side[1].extend(r_a0[-1])
-        all_offset_pts_by_side[2].extend(r_b0[-1])
-
-    # 2. Identify cutout faces (without deleting yet, so Pass 2 can still query kept faces in bm)
-    margin = eff_width * 0.75
+    # 1. Identify cutout faces (without deleting yet, so Pass 2 can still query kept faces in bm).
+    # Kept boundary must clear the widest possible collar rim (corner offsets stretch up to
+    # _CORNER_OFFSET_MAX x width) plus a bridge gap proportional to the local edge length.
+    # The gap uses each side's own edge length so a fine-meshed thin object is not swallowed
+    # by a clearance derived from a coarse partner.
+    clearance_by_side = {
+        sid: eff_width * _CORNER_OFFSET_MAX
+        + min(target_edge_len, _estimate_local_edge_length(bm, inter_verts, side_id=sid))
+        * CUTOUT_GAP_RATIO
+        for sid in (1, 2)
+    }
+    curve_kd = _build_curve_kdtree(raw_loop_coords, spacing=min(clearance_by_side.values()) * 0.1)
     to_remove = _expand_and_clean_cutout(
         bm=bm,
         inter_verts=inter_verts,
-        offset_pts_by_side=all_offset_pts_by_side,
-        margin=margin,
+        curve_kd=curve_kd,
+        clearance_by_side=clearance_by_side,
     )
 
     # Preview outer boundary loop lengths per side BEFORE deleting faces
